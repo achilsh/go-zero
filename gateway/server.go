@@ -82,6 +82,9 @@ func (s *Server) Stop() {
 }
 
 func (s *Server) build() error {
+	// 初始化http lb list  by upstreams.
+	HttpLBItems.Init(s.upstreams)
+
 	if err := s.ensureUpstreamNames(); err != nil {
 		return err
 	}
@@ -95,7 +98,7 @@ func (s *Server) build() error {
 		if up.Grpc != nil {
 			s.buildGrpcRoute(up, writer, cancel)
 		} else if up.Http != nil {
-			s.buildHttpRoute(up, writer)
+			s.buildHttpRoute_LB(up, writer)
 		}
 	}, func(pipe <-chan rest.Route, cancel func(error)) {
 		for route := range pipe {

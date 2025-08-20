@@ -14,9 +14,10 @@ type (
 
 	// HttpClientConf is the configuration for an HTTP client.
 	HttpClientConf struct {
-		Target  string
-		Prefix  string `json:",optional"`
-		Timeout int64  `json:",default=3000"`
+		Target   string       `json:",optional"`
+		Prefix   string       `json:",optional"`
+		Timeout  int64        `json:",default=3000"`
+		NodeList []NodeWeight `json:"NodeList,optional"`
 	}
 
 	// RouteMapping is a mapping between a gateway route and an upstream rpc method.

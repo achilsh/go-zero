@@ -84,6 +84,8 @@ func (s *Server) Stop() {
 func (s *Server) build() error {
 	// 初始化http lb list  by upstreams.
 	HttpLBItems.Init(s.upstreams)
+	// 根据重写配置构建重写句柄
+	RewriteURLHandler.Init(s.upstreams)
 
 	if err := s.ensureUpstreamNames(); err != nil {
 		return err
@@ -97,7 +99,8 @@ func (s *Server) build() error {
 		// up.Grpc and up.Http are exclusive
 		if up.Grpc != nil {
 			s.buildGrpcRoute(up, writer, cancel)
-		} else if up.Http != nil {
+			// } else if up.Http != nil {
+		} else {
 			s.buildHttpRoute_LB(up, writer)
 		}
 	}, func(pipe <-chan rest.Route, cancel func(error)) {

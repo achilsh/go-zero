@@ -16,46 +16,82 @@ import (
 	"github.com/zeromicro/go-zero/rest/httpx"
 )
 
+type RewriteKeyType struct {
+	UpstreamName string
+	MappingPath  string
+	//
+	RewritePattern string
+	RewriteTarget  string
+}
+
+func (u RewriteKeyType) Key() string {
+	s := fmt.Sprintf("%s:%s:%s:%s", u.UpstreamName, u.MappingPath, u.RewritePattern, u.RewriteTarget)
+	return s
+}
+
 type HttpLBNode struct {
-	LbHandle *httplb.SmoothWeightedRoundRobin
-	Name     string
+	LbHandle    *httplb.SmoothWeightedRoundRobin //每个服务名下面的节点列表
+	RewriteNode RewriteKeyType
 }
 
 type HttpLBManager struct {
-	ServerLbSet map[string]HttpLBNode //多个服务的路由列表;key为服务名
+	ServerLbSet map[string]*HttpLBNode //多个服务的路由列表;key 为 RewriteKeyType.Key()
+
 }
 
 func (hlbm *HttpLBManager) Init(upstreamCfg []Upstream) {
-
 	for _, upstream := range upstreamCfg {
-		item := HttpLBNode{
-			Name: upstream.Name,
-		}
-		if upstream.Http == nil {
+		var rewriteKey RewriteKeyType
+
+		if len(upstream.Name) <= 0 {
 			continue
 		}
+		rewriteKey.UpstreamName = upstream.Name
 
-		if len(upstream.Http.NodeList) <= 0 {
-			continue
-		}
+		for _, mapping := range upstream.Mappings {
+			if len(mapping.Path) <= 0 {
+				continue
+			}
+			rewriteKey.MappingPath = mapping.Path
 
-		// 初始化服务名下的一组后端路由节点
-		var lbTemp = make(map[string]httplb.WeightInfo)
-		for _, lb := range upstream.Http.NodeList {
-			lbTemp[lb.Target] = httplb.WeightInfo{
-				Weight:  lb.Weight,
-				Timeout: int(lb.Timeout),
+			for _, rewrite := range mapping.Rewrites {
+				if len(rewrite.Pattern) <= 0 || len(rewrite.Target) <= 0 {
+					continue
+				}
+				rewriteKey.RewritePattern = rewrite.Pattern
+				rewriteKey.RewriteTarget = rewrite.Target
+
+				// 一个url 对应一组 lb 节点
+				var lbTemp = make(map[string]httplb.WeightInfo)
+				for _, lb := range rewrite.NodeList {
+					lbTemp[lb.Node] = httplb.WeightInfo{
+						Weight:  lb.Weight,
+						Timeout: int(lb.Timeout),
+					}
+				}
+				if len(lbTemp) <= 0 {
+					continue
+				}
+
+				lbNodeTmp := httplb.NewSmoothWeightedRoundRobin(lbTemp)
+				if lbNodeTmp == nil {
+					continue
+				}
+				item := HttpLBNode{
+					LbHandle:    lbNodeTmp,
+					RewriteNode: rewriteKey,
+				}
+				hlbm.ServerLbSet[item.RewriteNode.Key()] = &item
 			}
 		}
-		item.LbHandle = httplb.NewSmoothWeightedRoundRobin(lbTemp)
-		hlbm.ServerLbSet[upstream.Name] = item
 	}
 }
 
-func (hlbm *HttpLBManager) FindLbServerListByServerName(serverName string) *httplb.SmoothWeightedRoundRobin {
-	if hlbm == nil || len(serverName) <= 0 {
+func (hlbm *HttpLBManager) FindLbServerListByServerName(rewriteNode RewriteKeyType) *httplb.SmoothWeightedRoundRobin {
+	if hlbm == nil {
 		return nil
 	}
+	serverName := rewriteNode.Key()
 	if _, ok := hlbm.ServerLbSet[serverName]; !ok {
 		return nil
 	}
@@ -70,28 +106,59 @@ func (hlbm *HttpLBManager) FindLbServerListByServerName(serverName string) *http
 
 var (
 	HttpLBItems *HttpLBManager = &HttpLBManager{
-		ServerLbSet: make(map[string]HttpLBNode),
+		ServerLbSet: make(map[string]*HttpLBNode),
 	}
 )
 
 func (s *Server) buildHttpRoute_LB(up Upstream, writer mr.Writer[rest.Route]) {
-	lbNodeList := HttpLBItems.FindLbServerListByServerName(up.Name)
-	if lbNodeList == nil {
-		panic(fmt.Sprintf("not find any lb node list for: %v", up.Name))
-	}
+	// 复用原有的逻辑，如果配置 Mappings 就按 原有的url规则接收数据
 	for _, m := range up.Mappings {
 		writer.Write(rest.Route{
 			Method:  strings.ToUpper(m.Method),
 			Path:    m.Path,
-			Handler: s.buildHttpHandler_LB(lbNodeList, up.Name),
+			Handler: s.buildHttpHandler_LB(up.Name, m),
 		})
 	}
 }
 
-func (s *Server) buildHttpHandler_LB(lbList *httplb.SmoothWeightedRoundRobin, serverName string) http.HandlerFunc {
+func (s *Server) buildHttpHandler_LB(upstreamName string, mapping RouteMapping) http.HandlerFunc {
+
 	handler := func(w http.ResponseWriter, r *http.Request) {
+
+		var lbList *httplb.SmoothWeightedRoundRobin = nil
+		var dstRewriteUrl string
+		for _, rewrite := range mapping.Rewrites {
+			var rewriteNode RewriteKeyType = RewriteKeyType{
+				UpstreamName: upstreamName,
+				MappingPath:  mapping.Path,
+				//
+				RewritePattern: rewrite.Pattern,
+				RewriteTarget:  rewrite.Target,
+			}
+
+			rewriteNodeHandle := RewriteURLHandler.FindUrlRewriteHandle(rewriteNode)
+			if rewriteNodeHandle == nil {
+				continue
+			}
+
+			if rewriteNodeHandle.RewriteR == nil {
+				continue
+			}
+			targetPath := rewriteNodeHandle.RewriteR.RewriteUrl(r.Method, r.URL.Path)
+			if targetPath != rewrite.Target {
+				continue
+			}
+
+			lbList = HttpLBItems.FindLbServerListByServerName(rewriteNode)
+			if lbList == nil {
+				panic(fmt.Sprintf("not find any lb node list for: %v", rewriteNode.Key()))
+			}
+			dstRewriteUrl = targetPath
+			break
+		}
+
 		if lbList == nil {
-			panic(fmt.Sprintf("not get lb node for this server: %v", serverName))
+			panic(fmt.Sprintf("not get lb node for this server:"))
 		}
 		target := lbList.Pick()
 		if target == nil {
@@ -99,8 +166,11 @@ func (s *Server) buildHttpHandler_LB(lbList *httplb.SmoothWeightedRoundRobin, se
 			return
 		}
 
+		logc.Infof(r.Context(), "========> lb origin path: %v, rewrite path: %v, target addr: %v",
+			r.URL.Path, dstRewriteUrl, target)
+
 		w.Header().Set(httpx.ContentType, httpx.JsonContentType)
-		req, err := buildRequestWithNewTarget_LB(r, target.GetAddr())
+		req, err := buildRequestWithNewTarget_LB(r, dstRewriteUrl, target.GetAddr())
 		if err != nil {
 			httpx.ErrorCtx(r.Context(), w, err)
 			return
@@ -137,9 +207,10 @@ func (s *Server) buildHttpHandler_LB(lbList *httplb.SmoothWeightedRoundRobin, se
 	return s.buildChainHandler(handler)
 }
 
-func buildRequestWithNewTarget_LB(r *http.Request, target string) (*http.Request, error) {
+func buildRequestWithNewTarget_LB(r *http.Request, dstPath string, target string) (*http.Request, error) {
 	u := *r.URL
 	u.Host = target
+	u.Path = dstPath
 	if len(u.Scheme) == 0 {
 		u.Scheme = defaultHttpScheme
 	}

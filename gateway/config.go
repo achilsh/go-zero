@@ -14,10 +14,9 @@ type (
 
 	// HttpClientConf is the configuration for an HTTP client.
 	HttpClientConf struct {
-		Target   string       `json:",optional"`
-		Prefix   string       `json:",optional"`
-		Timeout  int64        `json:",default=3000"`
-		NodeList []NodeWeight `json:"NodeList,optional"`
+		Target  string `json:",optional"`
+		Prefix  string `json:",optional"`
+		Timeout int64  `json:",default=3000"`
 	}
 
 	// RouteMapping is a mapping between a gateway route and an upstream rpc method.
@@ -29,6 +28,12 @@ type (
 		// RpcPath is the gRPC rpc method, with format of package.service/method, optional.
 		// If the mapping is for HTTP, it's not necessary.
 		RpcPath string `json:",optional"`
+
+		//  1 is http
+		HttpProxy int `json:",optional"`
+
+		// 增加重写机制配置
+		Rewrites []RewriteRuleCfgItem `json:",optional"`
 	}
 
 	// Upstream is the configuration for an upstream.
@@ -46,5 +51,7 @@ type (
 		// Mappings is the mapping between gateway routes and Upstream methods.
 		// Keep it blank if annotations are added in rpc methods.
 		Mappings []RouteMapping `json:",optional"`
+		// 增加重写机制配置
+		// Rewrites []RewriteRuleCfgItem `json:",optional"`
 	}
 )

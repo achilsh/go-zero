@@ -29,11 +29,14 @@ type WeightInfo struct {
 	Timeout int
 }
 
-// NewSmoothWeightedRoundRobin 创建实例; 入参为: 地址-权重 映射关系, 毫秒
+// NewSmoothWeightedRoundRobin 创建实例; 入参为: ip/port地址-权重 映射关系, 毫秒
 func NewSmoothWeightedRoundRobin(nodes map[string]WeightInfo) *SmoothWeightedRoundRobin {
-	s := &SmoothWeightedRoundRobin{}
+	var s *SmoothWeightedRoundRobin = nil
 	for addr, w := range nodes {
 		if w.Weight > 0 {
+			if s == nil {
+				s = &SmoothWeightedRoundRobin{}
+			}
 			s.nodes = append(s.nodes, &SmoothWeightedNode{
 				weight:          w.Weight,
 				effectiveWeight: w.Weight,

@@ -11,6 +11,7 @@ import (
 	"github.com/zeromicro/go-zero/core/logc"
 	"github.com/zeromicro/go-zero/core/mr"
 	httplb "github.com/zeromicro/go-zero/gateway/http_lb"
+	httprewrite "github.com/zeromicro/go-zero/gateway/http_rewrite"
 	"github.com/zeromicro/go-zero/rest"
 	"github.com/zeromicro/go-zero/rest/httpc"
 	"github.com/zeromicro/go-zero/rest/httpx"
@@ -121,41 +122,85 @@ func (s *Server) buildHttpRoute_LB(up Upstream, writer mr.Writer[rest.Route]) {
 	}
 }
 
+type RewriteNodeValue struct {
+	rewriteNode RewriteKeyType
+	regRotuer   *httprewrite.RegexpRouter
+}
+
 func (s *Server) buildHttpHandler_LB(upstreamName string, mapping RouteMapping) http.HandlerFunc {
+	var rewwriteKeyNodeMap map[string]RewriteNodeValue = make(map[string]RewriteNodeValue)
+	//
+	for _, rewrite := range mapping.Rewrites {
+		var rewriteNode RewriteKeyType = RewriteKeyType{
+			UpstreamName: upstreamName,
+			MappingPath:  mapping.Path,
+			//
+			RewritePattern: rewrite.Pattern,
+			RewriteTarget:  rewrite.Target,
+		}
+
+		rewriteNodeHandle := RewriteURLHandler.FindUrlRewriteHandle(rewriteNode)
+		if rewriteNodeHandle == nil {
+			continue
+		}
+		if rewriteNodeHandle.RewriteR == nil {
+			continue
+		}
+
+		rewwriteKeyNodeMap[rewriteNode.Key()] = RewriteNodeValue{
+			regRotuer:   rewriteNodeHandle.RewriteR,
+			rewriteNode: rewriteNode,
+		}
+	}
 
 	handler := func(w http.ResponseWriter, r *http.Request) {
 
 		var lbList *httplb.SmoothWeightedRoundRobin = nil
 		var dstRewriteUrl string
-		for _, rewrite := range mapping.Rewrites {
-			var rewriteNode RewriteKeyType = RewriteKeyType{
-				UpstreamName: upstreamName,
-				MappingPath:  mapping.Path,
-				//
-				RewritePattern: rewrite.Pattern,
-				RewriteTarget:  rewrite.Target,
-			}
 
-			rewriteNodeHandle := RewriteURLHandler.FindUrlRewriteHandle(rewriteNode)
-			if rewriteNodeHandle == nil {
+		for _, rewriteNodeValue := range rewwriteKeyNodeMap {
+
+			targetPath := rewriteNodeValue.regRotuer.RewriteUrl(r.Method, r.URL.Path)
+			if targetPath != rewriteNodeValue.rewriteNode.RewriteTarget {
 				continue
 			}
 
-			if rewriteNodeHandle.RewriteR == nil {
-				continue
-			}
-			targetPath := rewriteNodeHandle.RewriteR.RewriteUrl(r.Method, r.URL.Path)
-			if targetPath != rewrite.Target {
-				continue
-			}
-
-			lbList = HttpLBItems.FindLbServerListByServerName(rewriteNode)
+			lbList = HttpLBItems.FindLbServerListByServerName(rewriteNodeValue.rewriteNode)
 			if lbList == nil {
-				panic(fmt.Sprintf("not find any lb node list for: %v", rewriteNode.Key()))
+				panic(fmt.Sprintf("not find any lb node list for: %v", rewriteNodeValue.rewriteNode.Key()))
 			}
 			dstRewriteUrl = targetPath
 			break
 		}
+		// for _, rewrite := range mapping.Rewrites {
+		// 	var rewriteNode RewriteKeyType = RewriteKeyType{
+		// 		UpstreamName: upstreamName,
+		// 		MappingPath:  mapping.Path,
+		// 		//
+		// 		RewritePattern: rewrite.Pattern,
+		// 		RewriteTarget:  rewrite.Target,
+		// 	}
+
+		// 	rewriteNodeHandle := RewriteURLHandler.FindUrlRewriteHandle(rewriteNode)
+		// 	if rewriteNodeHandle == nil {
+		// 		continue
+		// 	}
+
+		// 	if rewriteNodeHandle.RewriteR == nil {
+		// 		continue
+		// 	}
+		// 	targetPath := rewriteNodeHandle.RewriteR.RewriteUrl(r.Method, r.URL.Path)
+		// 	if targetPath != rewrite.Target {
+		// 		continue
+		// 	}
+
+		// 	lbList = HttpLBItems.FindLbServerListByServerName(rewriteNode)
+		// 	if lbList == nil {
+		// 		panic(fmt.Sprintf("not find any lb node list for: %v", rewriteNode.Key()))
+		// 	}
+		// 	dstRewriteUrl = targetPath
+		// 	break
+		// }
 
 		if lbList == nil {
 			panic(fmt.Sprintf("not get lb node for this server:"))

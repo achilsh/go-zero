@@ -4,18 +4,22 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
+	"math/rand"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/zeromicro/go-zero/core/logc"
+	"github.com/zeromicro/go-zero/core/logx"
 	"github.com/zeromicro/go-zero/core/mr"
+	etcdlb "github.com/zeromicro/go-zero/gateway/http_client_etcd"
 	httplb "github.com/zeromicro/go-zero/gateway/http_lb"
 	httprewrite "github.com/zeromicro/go-zero/gateway/http_rewrite"
-	etcdlb "github.com/zeromicro/go-zero/gateway/httpclientetcd"
 	"github.com/zeromicro/go-zero/rest"
 	"github.com/zeromicro/go-zero/rest/httpc"
 	"github.com/zeromicro/go-zero/rest/httpx"
+	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 type RewriteKeyType struct {
@@ -67,27 +71,66 @@ func (hlbm *HttpLBManager) Init(upstreamCfg []Upstream) {
 				rewriteKey.RewriteTarget = rewrite.Target
 
 				// 一个url 对应一组 lb 节点；如果 NodeList 为空，则 hlbm.ServerLbSet 对应的该条的负载均衡器记录不存在
-				var lbTemp = make(map[string]httplb.WeightInfo)
-				//
-				for _, lb := range rewrite.NodeList {
-					lbTemp[lb.Node] = httplb.WeightInfo{
-						Weight:  lb.Weight,
-						Timeout: int(lb.Timeout),
+				if len(rewrite.NodeList) > 0 {
+					var lbTemp = make(map[string]httplb.WeightInfo)
+					for _, lb := range rewrite.NodeList {
+						lbTemp[lb.Node] = httplb.WeightInfo{
+							Weight:  lb.Weight,
+							Timeout: int(lb.Timeout),
+						}
+					}
+
+					if len(lbTemp) > 0 {
+						lbNodeTmp := httplb.NewSmoothWeightedRoundRobin(lbTemp)
+						if lbNodeTmp != nil {
+							if _, ok := hlbm.ServerLbSet[rewriteKey.Key()]; ok {
+								hlbm.ServerLbSet[rewriteKey.Key()].LbHandle = lbNodeTmp
+								hlbm.ServerLbSet[rewriteKey.Key()].RewriteNode = rewriteKey
+							} else {
+								hlbm.ServerLbSet[rewriteKey.Key()] = &HttpLBNode{
+									LbHandle:    lbNodeTmp,
+									RewriteNode: rewriteKey,
+								}
+							}
+						}
 					}
 				}
-				if len(lbTemp) <= 0 {
-					continue
-				}
 
-				lbNodeTmp := httplb.NewSmoothWeightedRoundRobin(lbTemp)
-				if lbNodeTmp == nil {
-					continue
+				if rewrite.Etcd != nil {
+					// etcd 连接配置
+					etcdlb.InitEtcConfig(rewrite.Etcd)
+
+					// 连接 etcd
+					cli, err := clientv3.New(*etcdlb.GetEtcdConfig(rewrite.Etcd))
+					if err != nil {
+						log.Fatalf("failed to connect etcd: %v", err)
+						continue
+					}
+
+					// 初始化 Discovery，订阅 "demo-service"
+					discovery := etcdlb.NewDiscovery(cli, rewrite.Etcd.Key)
+					if err := discovery.Start(context.Background()); err != nil {
+						log.Fatalf(
+							"discovery start error: %v, key: %v, host: %v",
+							err,
+							rewrite.Etcd.Key,
+							rewrite.Etcd.Hosts,
+						)
+						cli.Close()
+						continue
+					} else {
+
+						if _, ok := hlbm.ServerLbSet[rewriteKey.Key()]; ok {
+							hlbm.ServerLbSet[rewriteKey.Key()].EtcdDiscover = discovery
+							hlbm.ServerLbSet[rewriteKey.Key()].RewriteNode = rewriteKey
+						} else {
+							hlbm.ServerLbSet[rewriteKey.Key()] = &HttpLBNode{
+								EtcdDiscover: discovery,
+								RewriteNode:  rewriteKey,
+							}
+						}
+					}
 				}
-				item := HttpLBNode{
-					LbHandle:    lbNodeTmp,
-					RewriteNode: rewriteKey,
-				}
-				hlbm.ServerLbSet[item.RewriteNode.Key()] = &item
 			}
 		}
 	}
@@ -108,6 +151,23 @@ func (hlbm *HttpLBManager) FindLbServerListByServerName(rewriteNode RewriteKeyTy
 	}
 
 	return lbNodeHandle
+}
+
+func (hlbm *HttpLBManager) FindEtcdDiscoverByServerName(rewriteNode RewriteKeyType) *etcdlb.Discovery {
+	if hlbm == nil {
+		return nil
+	}
+	serverName := rewriteNode.Key()
+	if _, ok := hlbm.ServerLbSet[serverName]; !ok {
+		return nil
+	}
+
+	etcHandle := hlbm.ServerLbSet[serverName].EtcdDiscover
+	if etcHandle == nil {
+		return nil
+	}
+
+	return etcHandle
 }
 
 var (
@@ -162,76 +222,101 @@ func (s *Server) buildHttpHandler_LB(upstreamName string, mapping RouteMapping) 
 	handler := func(w http.ResponseWriter, r *http.Request) {
 
 		var lbList *httplb.SmoothWeightedRoundRobin = nil
+		var etcdHandle *etcdlb.Discovery = nil
 		var dstRewriteUrl string
+		var retwriteNodeFind *RewriteNodeValue = nil
 
-		for _, rewriteNodeValue := range rewwriteKeyNodeMap {
+		for _, rewriteNodeValueNode := range rewwriteKeyNodeMap {
 
+			retwriteNodeFind = &rewriteNodeValueNode
 			//根据实际请求的url找到对应的 重写规则记录，判断最终 target url是否是和配置中的
-			targetPath := rewriteNodeValue.regRotuer.RewriteUrl(r.Method, r.URL.Path)
+			targetPath := rewriteNodeValueNode.regRotuer.RewriteUrl(r.Method, r.URL.Path)
 			if targetPath == "" {
 				continue
 			}
-			if targetPath != rewriteNodeValue.rewriteNode.RewriteTarget {
+			if targetPath != rewriteNodeValueNode.rewriteNode.RewriteTarget {
 				continue
 			}
 
+			dstRewriteUrl = targetPath
 			//优先使用 配置的后端节点 负载均衡里列表
-			lbList = HttpLBItems.FindLbServerListByServerName(rewriteNodeValue.rewriteNode)
+			lbList = HttpLBItems.FindLbServerListByServerName(rewriteNodeValueNode.rewriteNode)
 			if lbList != nil {
-				dstRewriteUrl = targetPath
+				logx.Debugf("find lb direct node list for: %v", rewriteNodeValueNode.rewriteNode.Key())
 				break
 			}
 
-			//没找到对应的负载均衡节点列表， 则使用 etcd 获取upstream 节点
-			if lbList == nil {
-				panic(fmt.Sprintf("not find any lb node list for: %v", rewriteNodeValue.rewriteNode.Key()))
+			etcdHandle = HttpLBItems.FindEtcdDiscoverByServerName(rewriteNodeValueNode.rewriteNode)
+			if etcdHandle != nil {
+				logx.Debugf("find lb etcd node list for: %v", rewriteNodeValueNode.rewriteNode.Key())
+				break
 			}
-
 		}
-		// for _, rewrite := range mapping.Rewrites {
-		// 	var rewriteNode RewriteKeyType = RewriteKeyType{
-		// 		UpstreamName: upstreamName,
-		// 		MappingPath:  mapping.Path,
-		// 		//
-		// 		RewritePattern: rewrite.Pattern,
-		// 		RewriteTarget:  rewrite.Target,
-		// 	}
 
-		// 	rewriteNodeHandle := RewriteURLHandler.FindUrlRewriteHandle(rewriteNode)
-		// 	if rewriteNodeHandle == nil {
-		// 		continue
-		// 	}
-
-		// 	if rewriteNodeHandle.RewriteR == nil {
-		// 		continue
-		// 	}
-		// 	targetPath := rewriteNodeHandle.RewriteR.RewriteUrl(r.Method, r.URL.Path)
-		// 	if targetPath != rewrite.Target {
-		// 		continue
-		// 	}
-
-		// 	lbList = HttpLBItems.FindLbServerListByServerName(rewriteNode)
-		// 	if lbList == nil {
-		// 		panic(fmt.Sprintf("not find any lb node list for: %v", rewriteNode.Key()))
-		// 	}
-		// 	dstRewriteUrl = targetPath
-		// 	break
-		// }
-
-		if lbList == nil {
-			panic(fmt.Sprintf("not get lb node for this server:"))
-		}
-		target := lbList.Pick()
-		if target == nil {
-			fmt.Println("has no any for upstream router.")
+		if lbList == nil && etcdHandle == nil {
+			httpx.ErrorCtx(
+				r.Context(),
+				w,
+				fmt.Errorf("not find any avail node, key: %s", retwriteNodeFind.rewriteNode.Key()),
+			)
+			panic(fmt.Sprintf("not config lb node or etcd for this server: %v", upstreamName))
 			return
 		}
 
-		logc.Infof(r.Context(), "========> lb origin path: %v, rewrite path: %v, target addr: %v",
-			r.URL.Path, dstRewriteUrl, target)
+		var remoteAddr string
+		var targetTmout int = 0
+		//
+		if lbList != nil {
+			target := lbList.Pick()
+			if target == nil {
+				httpx.ErrorCtx(
+					r.Context(),
+					w,
+					fmt.Errorf("from lb not get any node, key: %s", retwriteNodeFind.rewriteNode.Key()),
+				)
+
+				fmt.Println("has no any for upstream router, key: ", retwriteNodeFind.rewriteNode.Key())
+				return
+			}
+
+			logc.Infof(r.Context(), "========> lb origin path: %v, rewrite path: %v, target addr: %v",
+				r.URL.Path, dstRewriteUrl, target)
+
+			remoteAddr = target.GetAddr()
+			targetTmout = target.GetTimeout()
+		}
+
+		if etcdHandle != nil {
+			keysAddrMap := etcdHandle.Snapshot()
+			if len(keysAddrMap) == 0 {
+				logx.Errorf("etcd get no any upstream node, key: %v")
+				httpx.ErrorCtx(
+					r.Context(),
+					w,
+					fmt.Errorf("etcd get no any upstream node, key: %v", etcdHandle.GetKey()),
+				)
+				return
+			}
+			//
+
+			randomGet := func(ips []string) string {
+				if len(ips) == 0 {
+					return ""
+				}
+				idx := rand.Intn(len(ips)) // [0, len(ips))
+				return ips[idx]
+			}
+
+			target := randomGet(keysAddrMap)
+			logc.Infof(r.Context(), "========> etcd origin path: %v, rewrite path: %v, in etcd addr: %v",
+				r.URL.Path, dstRewriteUrl, target)
+
+			remoteAddr = target
+			targetTmout = 3000
+		}
 
 		w.Header().Set(httpx.ContentType, httpx.JsonContentType)
-		req, err := buildRequestWithNewTarget_LB(r, dstRewriteUrl, target.GetAddr())
+		req, err := buildRequestWithNewTarget_LB(r, dstRewriteUrl, remoteAddr)
 		if err != nil {
 			httpx.ErrorCtx(r.Context(), w, err)
 			return
@@ -239,8 +324,8 @@ func (s *Server) buildHttpHandler_LB(upstreamName string, mapping RouteMapping) 
 
 		// set the timeout if it's configured, take effect only if it's greater than 0
 		// and less than the deadline of the original request
-		if target.GetTimeout() > 0 {
-			timeout := time.Duration(target.GetTimeout()) * time.Millisecond
+		if targetTmout > 0 {
+			timeout := time.Duration(targetTmout) * time.Millisecond
 			ctx, cancel := context.WithTimeout(r.Context(), timeout)
 			defer cancel()
 			req = req.WithContext(ctx)

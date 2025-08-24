@@ -9,5 +9,5 @@ type RewriteRuleCfgItem struct {
 	NodeList []NodeWeight `json:"NodeList,optional"` //直接配置的 后端 IP的节点，包括权重，请求超时设置
 
 	// http url 重写后通过 etcd 服务发现的 etcd 配置
-	Etcd discov.EtcdConf `json:",optional"`
+	Etcd *discov.EtcdConf `json:",optional"`
 }

@@ -25,6 +25,10 @@ type Discovery struct {
 	updates chan clientv3.WatchResponse
 }
 
+func (d *Discovery) GetKey() string {
+	return d.service
+}
+
 func NewDiscovery(cli *clientv3.Client, service string) *Discovery {
 	if !strings.HasPrefix(service, "/") {
 		service = "/" + service

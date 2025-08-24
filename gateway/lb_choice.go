@@ -12,6 +12,7 @@ import (
 	"github.com/zeromicro/go-zero/core/mr"
 	httplb "github.com/zeromicro/go-zero/gateway/http_lb"
 	httprewrite "github.com/zeromicro/go-zero/gateway/http_rewrite"
+	etcdlb "github.com/zeromicro/go-zero/gateway/httpclientetcd"
 	"github.com/zeromicro/go-zero/rest"
 	"github.com/zeromicro/go-zero/rest/httpc"
 	"github.com/zeromicro/go-zero/rest/httpx"
@@ -31,11 +32,14 @@ func (u RewriteKeyType) Key() string {
 }
 
 type HttpLBNode struct {
-	LbHandle    *httplb.SmoothWeightedRoundRobin //每个服务名下面的节点列表
-	RewriteNode RewriteKeyType
+	LbHandle     *httplb.SmoothWeightedRoundRobin //每条rewrite对应的负载均衡器的节点列表
+	RewriteNode  RewriteKeyType                   //每条rewrite规则
+	EtcdDiscover *etcdlb.Discovery                //如果 NodeList 为空，则通过 etcd 获取节点
 }
 
 type HttpLBManager struct {
+	// 一条rewrite规则 对应 一个负载均衡节点， 对应下面map中的一条记录。
+	//如果配置中的 某条记录 NodeList 为空，该map 就不会有这条记录对应的负载均衡器记录，比如 RewriteKeyType.Key() 该条记录对应的value为空
 	ServerLbSet map[string]*HttpLBNode //多个服务的路由列表;key 为 RewriteKeyType.Key()
 
 }
@@ -62,8 +66,9 @@ func (hlbm *HttpLBManager) Init(upstreamCfg []Upstream) {
 				rewriteKey.RewritePattern = rewrite.Pattern
 				rewriteKey.RewriteTarget = rewrite.Target
 
-				// 一个url 对应一组 lb 节点
+				// 一个url 对应一组 lb 节点；如果 NodeList 为空，则 hlbm.ServerLbSet 对应的该条的负载均衡器记录不存在
 				var lbTemp = make(map[string]httplb.WeightInfo)
+				//
 				for _, lb := range rewrite.NodeList {
 					lbTemp[lb.Node] = httplb.WeightInfo{
 						Weight:  lb.Weight,
@@ -153,6 +158,7 @@ func (s *Server) buildHttpHandler_LB(upstreamName string, mapping RouteMapping) 
 		}
 	}
 
+	// 对每个请求的处理逻辑:
 	handler := func(w http.ResponseWriter, r *http.Request) {
 
 		var lbList *httplb.SmoothWeightedRoundRobin = nil
@@ -160,17 +166,27 @@ func (s *Server) buildHttpHandler_LB(upstreamName string, mapping RouteMapping) 
 
 		for _, rewriteNodeValue := range rewwriteKeyNodeMap {
 
+			//根据实际请求的url找到对应的 重写规则记录，判断最终 target url是否是和配置中的
 			targetPath := rewriteNodeValue.regRotuer.RewriteUrl(r.Method, r.URL.Path)
+			if targetPath == "" {
+				continue
+			}
 			if targetPath != rewriteNodeValue.rewriteNode.RewriteTarget {
 				continue
 			}
 
+			//优先使用 配置的后端节点 负载均衡里列表
 			lbList = HttpLBItems.FindLbServerListByServerName(rewriteNodeValue.rewriteNode)
+			if lbList != nil {
+				dstRewriteUrl = targetPath
+				break
+			}
+
+			//没找到对应的负载均衡节点列表， 则使用 etcd 获取upstream 节点
 			if lbList == nil {
 				panic(fmt.Sprintf("not find any lb node list for: %v", rewriteNodeValue.rewriteNode.Key()))
 			}
-			dstRewriteUrl = targetPath
-			break
+
 		}
 		// for _, rewrite := range mapping.Rewrites {
 		// 	var rewriteNode RewriteKeyType = RewriteKeyType{
@@ -254,6 +270,7 @@ func (s *Server) buildHttpHandler_LB(upstreamName string, mapping RouteMapping) 
 
 func buildRequestWithNewTarget_LB(r *http.Request, dstPath string, target string) (*http.Request, error) {
 	u := *r.URL
+	// 主要是修改 upstream 的 host and path
 	u.Host = target
 	u.Path = dstPath
 	if len(u.Scheme) == 0 {

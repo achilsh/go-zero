@@ -19,7 +19,7 @@ type Discovery struct {
 
 	mu sync.RWMutex
 	// cache map[string]ServiceInstance // 增量维护快照
-	cache map[string]string // 增量维护快照
+	cache map[string]string // 增量维护快照，key 是 rpc_etcd1.rpc.1/7668672329854348691
 	rev   int64
 
 	updates chan clientv3.WatchResponse
@@ -51,7 +51,7 @@ func (d *Discovery) Start(ctx context.Context) error {
 		}
 
 		fmt.Printf("discovery router cache key: %v\n", string(kv.Key))
-		//输出的格式是： rpc_etcd1.rpc.1/7668672329854348691， key:lease
+		//输出的格式是： rpc_etcd1.rpc.1/7668672329854348691，=> key:lease
 		d.cache[string(kv.Key)] = string(kv.Value)
 		// if err := json.Unmarshal(kv.Value, &si); err == nil {
 		// 	d.cache[string(kv.Key)] = si
@@ -59,7 +59,7 @@ func (d *Discovery) Start(ctx context.Context) error {
 	}
 	d.rev = resp.Header.Revision
 
-	d.updates = make(chan clientv3.WatchResponse, 16)
+	d.updates = make(chan clientv3.WatchResponse, 100)
 	go d.watch(ctx)
 	go d.applyLoop(ctx)
 	return nil
@@ -86,7 +86,7 @@ func (d *Discovery) watch(ctx context.Context) {
 }
 
 func (d *Discovery) applyLoop(ctx context.Context) {
-	ticker := time.NewTicker(200 * time.Millisecond) // 去抖
+	ticker := time.NewTicker(50 * time.Millisecond) // 去抖
 	defer ticker.Stop()
 
 	var pending []clientv3.WatchResponse
@@ -145,4 +145,15 @@ func (d *Discovery) Snapshot() []string {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
 	return out
+}
+
+// key 格式是：rpc_etcd1.rpc.1/7668672329854348691
+func (d *Discovery) SnapshotMap() map[string]string {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	ret := make(map[string]string)
+	for k, v := range d.cache {
+		ret[k] = v
+	}
+	return ret
 }
